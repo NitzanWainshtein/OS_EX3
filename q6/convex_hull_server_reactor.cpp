@@ -9,7 +9,11 @@
 
 #include <iostream>
 #include <vector>
+#include <fcntl.h>
+#include <errno.h>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <iomanip>
 #include <string>
@@ -56,13 +60,36 @@ int serverSocket;
 
 // Utilities
 Point parsePointFromString(const string& pointString) {
-    size_t comma = pointString.find(',');
-    return Point(stod(pointString.substr(0, comma)), stod(pointString.substr(comma + 1)));
+    try {
+        size_t comma = pointString.find(',');
+        if (comma == string::npos) {
+            throw invalid_argument("Invalid point format: missing comma");
+        }
+        
+        string xStr = pointString.substr(0, comma);
+        string yStr = pointString.substr(comma + 1);
+        
+        // Remove whitespace
+        xStr.erase(remove_if(xStr.begin(), xStr.end(), ::isspace), xStr.end());
+        yStr.erase(remove_if(yStr.begin(), yStr.end(), ::isspace), yStr.end());
+        
+        if (xStr.empty() || yStr.empty()) {
+            throw invalid_argument("Invalid point format: empty coordinate");
+        }
+        
+        double x = stod(xStr);
+        double y = stod(yStr);
+        
+        return Point(x, y);
+    } catch (const exception& e) {
+        throw invalid_argument("Invalid point format: " + string(e.what()));
+    }
 }
 
 void sendMessageToClient(int clientSocket, const string& msg) {
     string formatted = msg + "\n";
     send(clientSocket, formatted.c_str(), formatted.size(), 0);
+    cout << "[sendMessageToClient] socket=" << clientSocket << ", message=\"" << msg << "\"" << endl;
 }
 
 double crossProduct(const Point& o, const Point& a, const Point& b) {
@@ -92,9 +119,11 @@ vector<Point> computeConvexHull(vector<Point> pts) {
 }
 
 double calculatePolygonArea(const vector<Point>& poly) {
+    if (poly.size() < 3) return 0.0;
+    
     double area = 0;
-    for (int i = 0; i < static_cast<int>(poly.size()); i++) {
-        int j = (i + 1) % poly.size();
+    for (size_t i = 0; i < poly.size(); i++) {
+        size_t j = (i + 1) % poly.size();
         area += poly[i].x * poly[j].y - poly[j].x * poly[i].y;
     }
     return fabs(area) / 2.0;
@@ -104,7 +133,8 @@ void executeClientCommand(int clientSocket, const string& command);
 
 void processWaitingCommands() {
     while (!waitingCommands.empty() && !isGraphLocked) {
-        auto cmd = waitingCommands.front(); waitingCommands.pop();
+        auto cmd = waitingCommands.front();
+        waitingCommands.pop();
         executeClientCommand(cmd.clientSocket, cmd.commandText);
     }
 }
@@ -112,47 +142,72 @@ void processWaitingCommands() {
 void executeClientCommand(int clientSocket, const string& command) {
     cout << "[executeClientCommand] socket=" << clientSocket << ", command='" << command << "'" << endl;
 
-    if (command.substr(0, 9) == "Newgraph ") {
-        isGraphLocked = true;
-        lockingClientSocket = clientSocket;
-        int n = stoi(command.substr(9));
-        sharedGraphPoints.clear();
-        sendMessageToClient(clientSocket, "Enter " + to_string(n) + " points (x,y):");
-        clientInputState[clientSocket] = 1;
-        pointsToRead[clientSocket] = n;
-        pointsAlreadyRead[clientSocket] = 0;
-    } else if (command == "CH") {
-        if (sharedGraphPoints.size() < 3) sendMessageToClient(clientSocket, "0");
-        else {
-            auto hull = computeConvexHull(sharedGraphPoints);
-            double area = calculatePolygonArea(hull);
-            ostringstream out;
-            out << fixed << setprecision(1) << area;
-            sendMessageToClient(clientSocket, out.str());
-        }
-    } else if (command.substr(0, 9) == "Newpoint ") {
-        isGraphLocked = true;
-        lockingClientSocket = clientSocket;
-        Point p = parsePointFromString(command.substr(9));
-        sharedGraphPoints.push_back(p);
-        sendMessageToClient(clientSocket, "Point added");
-        isGraphLocked = false;
-        lockingClientSocket = -1;
-        processWaitingCommands();
-    } else if (command.substr(0, 12) == "Removepoint ") {
-        isGraphLocked = true;
-        lockingClientSocket = clientSocket;
-        Point p = parsePointFromString(command.substr(12));
-        for (int i = sharedGraphPoints.size()-1; i >= 0; --i) {
-            if (fabs(sharedGraphPoints[i].x - p.x) < 1e-9 && fabs(sharedGraphPoints[i].y - p.y) < 1e-9) {
-                sharedGraphPoints.erase(sharedGraphPoints.begin() + i);
-                break;
+    try {
+        if (command.substr(0, 9) == "Newgraph ") {
+            int n;
+            try {
+                n = stoi(command.substr(9));
+                if (n <= 0) {
+                    throw invalid_argument("Number of points must be positive");
+                }
+            } catch (const exception& e) {
+                sendMessageToClient(clientSocket, "Error: Invalid number of points");
+                return;
             }
+            
+            isGraphLocked = true;
+            lockingClientSocket = clientSocket;
+            sharedGraphPoints.clear();
+            sendMessageToClient(clientSocket, "Enter " + to_string(n) + " points (x,y):");
+            clientInputState[clientSocket] = 1;
+            pointsToRead[clientSocket] = n;
+            pointsAlreadyRead[clientSocket] = 0;
+            
+        } else if (command == "CH") {
+            if (sharedGraphPoints.size() < 3) {
+                sendMessageToClient(clientSocket, "0");
+            } else {
+                auto hull = computeConvexHull(sharedGraphPoints);
+                double area = calculatePolygonArea(hull);
+                ostringstream out;
+                out << fixed << setprecision(1) << area;
+                sendMessageToClient(clientSocket, out.str());
+            }
+            
+        } else if (command.substr(0, 9) == "Newpoint ") {
+            Point p = parsePointFromString(command.substr(9));
+            isGraphLocked = true;
+            lockingClientSocket = clientSocket;
+            sharedGraphPoints.push_back(p);
+            sendMessageToClient(clientSocket, "Point added");
+            isGraphLocked = false;
+            lockingClientSocket = -1;
+            processWaitingCommands();
+            
+        } else if (command.substr(0, 12) == "Removepoint ") {
+            Point p = parsePointFromString(command.substr(12));
+            isGraphLocked = true;
+            lockingClientSocket = clientSocket;
+            
+            bool found = false;
+            for (int i = sharedGraphPoints.size()-1; i >= 0; --i) {
+                if (fabs(sharedGraphPoints[i].x - p.x) < 1e-9 && fabs(sharedGraphPoints[i].y - p.y) < 1e-9) {
+                    sharedGraphPoints.erase(sharedGraphPoints.begin() + i);
+                    found = true;
+                    break;
+                }
+            }
+            
+            sendMessageToClient(clientSocket, found ? "Point removed" : "Point not found");
+            isGraphLocked = false;
+            lockingClientSocket = -1;
+            processWaitingCommands();
+            
+        } else {
+            sendMessageToClient(clientSocket, "Error: Unknown command");
         }
-        sendMessageToClient(clientSocket, "Point removed");
-        isGraphLocked = false;
-        lockingClientSocket = -1;
-        processWaitingCommands();
+    } catch (const exception& e) {
+        sendMessageToClient(clientSocket, "Error: " + string(e.what()));
     }
 }
 
@@ -163,60 +218,95 @@ void handleClientCommand(int clientSocket, const string& input) {
     while (!command.empty() && isspace(command.back())) command.pop_back();
     if (command.empty()) return;
 
-    if (clientInputState[clientSocket] == 1) {
-        Point p = parsePointFromString(command);
-        sharedGraphPoints.push_back(p);
-        pointsAlreadyRead[clientSocket]++;
-        sendMessageToClient(clientSocket, "Point " + to_string(pointsAlreadyRead[clientSocket]) + " accepted");
+    try {
+        if (clientInputState[clientSocket] == 1) {
+            Point p = parsePointFromString(command);
+            sharedGraphPoints.push_back(p);
+            pointsAlreadyRead[clientSocket]++;
+            sendMessageToClient(clientSocket, "Point " + to_string(pointsAlreadyRead[clientSocket]) + " accepted");
 
-        if (pointsAlreadyRead[clientSocket] >= pointsToRead[clientSocket]) {
-            sendMessageToClient(clientSocket, "Graph created with " + to_string(pointsAlreadyRead[clientSocket]) + " points");
-            clientInputState[clientSocket] = 0;
-            isGraphLocked = false;
-            lockingClientSocket = -1;
-            processWaitingCommands();
+            if (pointsAlreadyRead[clientSocket] >= pointsToRead[clientSocket]) {
+                sendMessageToClient(clientSocket, "Graph created with " + to_string(pointsAlreadyRead[clientSocket]) + " points");
+                clientInputState[clientSocket] = 0;
+                isGraphLocked = false;
+                lockingClientSocket = -1;
+                processWaitingCommands();
+            }
+            return;
         }
-        return;
-    }
 
-    bool needsLock = command == "CH" || command.substr(0,9) == "Newgraph " ||
-                     command.substr(0,9) == "Newpoint " || command.substr(0,12) == "Removepoint ";
-    if (isGraphLocked && needsLock) {
-        waitingCommands.push(PendingCommand(clientSocket, command));
-        sendMessageToClient(clientSocket, "Command queued");
-        return;
-    }
+        bool needsLock = command == "CH" || command.substr(0,9) == "Newgraph " ||
+                      command.substr(0,9) == "Newpoint " || command.substr(0,12) == "Removepoint ";
+                      
+        if (isGraphLocked && needsLock && lockingClientSocket != clientSocket) {
+            waitingCommands.push(PendingCommand(clientSocket, command));
+            sendMessageToClient(clientSocket, "Command queued");
+            return;
+        }
 
-    executeClientCommand(clientSocket, command);
+        executeClientCommand(clientSocket, command);
+        
+    } catch (const exception& e) {
+        sendMessageToClient(clientSocket, "Error: " + string(e.what()));
+        if (clientInputState[clientSocket] == 1) {
+            sendMessageToClient(clientSocket, "Please enter point " + 
+                to_string(pointsAlreadyRead[clientSocket] + 1) + " again (x,y):");
+        }
+    }
 }
 
 void handleNewConnection(int fd) {
     sockaddr_in addr;
     socklen_t size = sizeof(addr);
     int client = accept(fd, (sockaddr*)&addr, &size);
-    if (client < 0) return;
+    if (client < 0) {
+        cerr << "Error accepting client connection" << endl;
+        return;
+    }
 
     cout << "New client connected: " << client << endl;
+    
+    // Initialize client state
+    clientBuffers[client] = "";
+    clientInputState[client] = 0;
+    pointsToRead[client] = 0;
+    pointsAlreadyRead[client] = 0;
+
+    // הגדרת non-blocking mode עבור הסוקט של הלקוח
+    int flags = fcntl(client, F_GETFL, 0);
+    fcntl(client, F_SETFL, flags | O_NONBLOCK);
+
     sendMessageToClient(client, "Convex Hull Server Ready");
     sendMessageToClient(client, "Commands: Newgraph n, CH, Newpoint x,y, Removepoint x,y");
 
-    clientBuffers[client] = "";
-
-    // ✅ תיקון: שימוש ב-[=] ו־fd מה־Reactor ולא בלכידה לפי ערך
-    reactor.addFd(client, [](int fd) {
+    auto clientHandler = [](int fd) {
         char buf[MAX_BUFFER_SIZE];
         int bytes = recv(fd, buf, sizeof(buf)-1, 0);
+        
         if (bytes <= 0) {
-            cout << "Client " << fd << " disconnected" << endl;
-            close(fd);
-            reactor.removeFd(fd);
-            clientBuffers.erase(fd);
+            if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                cout << "Client " << fd << " disconnected" << endl;
+                
+                // ניקוי משאבי הלקוח
+                if (lockingClientSocket == fd) {
+                    isGraphLocked = false;
+                    lockingClientSocket = -1;
+                    processWaitingCommands();
+                }
+                
+                close(fd);
+                reactor.removeFd(fd);
+                clientBuffers.erase(fd);
+                clientInputState.erase(fd);
+                pointsToRead.erase(fd);
+                pointsAlreadyRead.erase(fd);
+            }
             return;
         }
 
         buf[bytes] = '\0';
         string input(buf);
-        cout << "[lambda] received command from fd=" << fd << ": \"" << input << "\"" << endl;
+        cout << "[lambda] received from fd=" << fd << ": \"" << input << "\"" << endl;
 
         clientBuffers[fd] += input;
 
@@ -224,9 +314,18 @@ void handleNewConnection(int fd) {
         while ((pos = clientBuffers[fd].find('\n')) != string::npos) {
             string cmd = clientBuffers[fd].substr(0, pos);
             clientBuffers[fd].erase(0, pos + 1);
-            handleClientCommand(fd, cmd);
+            
+            // הסרת whitespace מתחילת וסוף הפקודה
+            cmd.erase(0, cmd.find_first_not_of(" \t\r\n"));
+            cmd.erase(cmd.find_last_not_of(" \t\r\n") + 1);
+            
+            if (!cmd.empty()) {
+                handleClientCommand(fd, cmd);
+            }
         }
-    });
+    };
+
+    reactor.addFd(client, clientHandler);
 }
 
 int main() {
@@ -240,8 +339,15 @@ int main() {
     addr.sin_addr.s_addr = INADDR_ANY;
     memset(&(addr.sin_zero), '\0', 8);
 
-    bind(serverSocket, (sockaddr*)&addr, sizeof(addr));
-    listen(serverSocket, 10);
+    if (bind(serverSocket, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        cerr << "Error binding socket" << endl;
+        return 1;
+    }
+    
+    if (listen(serverSocket, 10) < 0) {
+        cerr << "Error listening on socket" << endl;
+        return 1;
+    }
 
     cout << "Server started on port " << PORT << " using Reactor pattern" << endl;
 
@@ -249,6 +355,7 @@ int main() {
     reactor.start();
 
     while (true) sleep(1);
+    
     close(serverSocket);
     return 0;
 }
