@@ -1,8 +1,9 @@
 /**
- * Q7 - Multi-threaded Convex Hull Server
- * 
+ * Q7 - Multi-threaded Convex Hull Server (Thread-Safe Fixed Version)
+ * ------------------------------------------------------------------
  * This server implements a thread per client model for handling convex hull calculations.
  * Each client gets its own thread, with shared graph access protected by mutex.
+ * Proper thread management, cleanup, and graceful shutdown implemented.
  */
 
 #include <iostream>
@@ -19,6 +20,10 @@
 #include <unistd.h>
 #include <cstring>
 #include <memory>
+#include <atomic>
+#include <condition_variable>
+#include <fcntl.h>
+#include <signal.h>
 
 using namespace std;
 
@@ -32,10 +37,32 @@ struct Point {
     Point(double x, double y) : x(x), y(y) {}
 };
 
-// Shared resources protected by mutex
+// Thread management structure
+struct ClientThread {
+    thread clientThread;
+    atomic<bool> isActive;
+    int clientSocket;
+    
+    ClientThread(int socket) : isActive(true), clientSocket(socket) {}
+};
+
+// Global shared resources protected by mutexes
 vector<Point> sharedGraphPoints;
-mutex graphMutex;
-map<int, thread> clientThreads;
+mutex graphMutex;                    // Protects the shared graph
+map<int, unique_ptr<ClientThread>> clientThreads;
+mutex threadMapMutex;                // Protects clientThreads map
+atomic<bool> serverRunning(true);    // Server shutdown flag
+
+// Cleanup management
+mutex cleanupMutex;
+condition_variable cleanupCondition;
+thread cleanupThread;
+
+// Function declarations
+void cleanupFinishedThreads();
+void cleanupClient(int clientSocket);
+void handleClient(int clientSocket);
+void signalHandler(int signum);
 
 // Utility functions
 Point parsePointFromString(const string& pointString) {
@@ -109,11 +136,58 @@ double calculatePolygonArea(const vector<Point>& poly) {
     return fabs(area) / 2.0;
 }
 
-// Send formatted message to client with logging
-void sendMessageToClient(int clientSocket, const string& msg) {
+// Send formatted message to client with error checking
+bool sendMessageToClient(int clientSocket, const string& msg) {
     string formatted = msg + "\n";
-    send(clientSocket, formatted.c_str(), formatted.length(), 0);
+    ssize_t sent = send(clientSocket, formatted.c_str(), formatted.length(), MSG_NOSIGNAL);
+    if (sent < 0) {
+        cout << "[Client " << clientSocket << "] Error sending message: " << strerror(errno) << endl;
+        return false;
+    }
     cout << "[Client " << clientSocket << "] Sent: " << msg << endl;
+    return true;
+}
+
+// Clean up finished threads periodically
+void cleanupFinishedThreads() {
+    while (serverRunning) {
+        {
+            unique_lock<mutex> lock(cleanupMutex);
+            cleanupCondition.wait_for(lock, chrono::seconds(5)); // Check every 5 seconds
+        }
+        
+        vector<int> socketsToClean;
+        {
+            lock_guard<mutex> lock(threadMapMutex);
+            for (auto it = clientThreads.begin(); it != clientThreads.end();) {
+                if (!it->second->isActive && it->second->clientThread.joinable()) {
+                    cout << "[CleanupThread] Joining finished thread for client " << it->first << endl;
+                    it->second->clientThread.join();
+                    it = clientThreads.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+    cout << "[CleanupThread] Cleanup thread terminated" << endl;
+}
+
+// Clean up specific client
+void cleanupClient(int clientSocket) {
+    cout << "[CleanupClient] Cleaning up client " << clientSocket << endl;
+    
+    {
+        lock_guard<mutex> lock(threadMapMutex);
+        auto it = clientThreads.find(clientSocket);
+        if (it != clientThreads.end()) {
+            it->second->isActive = false;
+            // Don't erase here - let cleanup thread handle it
+        }
+    }
+    
+    close(clientSocket);
+    cleanupCondition.notify_one(); // Wake up cleanup thread
 }
 
 /**
@@ -124,8 +198,14 @@ void handleClient(int clientSocket) {
     cout << "[Client " << clientSocket << "] Thread started" << endl;
     
     // Initial client setup
-    sendMessageToClient(clientSocket, "Convex Hull Server Ready");
-    sendMessageToClient(clientSocket, "Commands: Newgraph n, CH, Newpoint x,y, Removepoint x,y");
+    if (!sendMessageToClient(clientSocket, "Convex Hull Server Ready")) {
+        cleanupClient(clientSocket);
+        return;
+    }
+    if (!sendMessageToClient(clientSocket, "Commands: Newgraph n, CH, Newpoint x,y, Removepoint x,y")) {
+        cleanupClient(clientSocket);
+        return;
+    }
 
     char buffer[MAX_BUFFER_SIZE];
     string accumulatedInput;
@@ -134,10 +214,23 @@ void handleClient(int clientSocket) {
     bool readingPoints = false;
 
     // Main client communication loop
-    while (true) {
-        int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+    while (serverRunning) {
+        // Set socket timeout for recv to check serverRunning periodically
+        struct timeval tv;
+        tv.tv_sec = 1;   // 1 second timeout
+        tv.tv_usec = 0;
+        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+        
+        ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
         if (bytesRead <= 0) {
-            cout << "[Client " << clientSocket << "] Disconnected" << endl;
+            if (bytesRead == 0) {
+                cout << "[Client " << clientSocket << "] Disconnected normally" << endl;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Timeout occurred, check if server is still running
+                continue;
+            } else {
+                cout << "[Client " << clientSocket << "] Disconnected with error: " << strerror(errno) << endl;
+            }
             break;
         }
 
@@ -167,12 +260,16 @@ void handleClient(int clientSocket) {
                         sharedGraphPoints.push_back(p);
                     }
                     pointsRead++;
-                    sendMessageToClient(clientSocket, "Point " + to_string(pointsRead) + " accepted");
+                    if (!sendMessageToClient(clientSocket, "Point " + to_string(pointsRead) + " accepted")) {
+                        goto client_disconnected;
+                    }
 
                     if (pointsRead >= pointsToRead) {
                         readingPoints = false;
-                        sendMessageToClient(clientSocket, 
-                            "Graph created with " + to_string(pointsRead) + " points");
+                        if (!sendMessageToClient(clientSocket, 
+                            "Graph created with " + to_string(pointsRead) + " points")) {
+                            goto client_disconnected;
+                        }
                     }
                     continue;
                 }
@@ -185,7 +282,9 @@ void handleClient(int clientSocket) {
                             throw invalid_argument("Number of points must be positive");
                         }
                     } catch (const exception& e) {
-                        sendMessageToClient(clientSocket, "Error: Invalid number of points");
+                        if (!sendMessageToClient(clientSocket, "Error: Invalid number of points")) {
+                            goto client_disconnected;
+                        }
                         continue;
                     }
 
@@ -195,7 +294,9 @@ void handleClient(int clientSocket) {
                     }
                     pointsRead = 0;
                     readingPoints = true;
-                    sendMessageToClient(clientSocket, "Enter " + to_string(pointsToRead) + " points (x,y):");
+                    if (!sendMessageToClient(clientSocket, "Enter " + to_string(pointsToRead) + " points (x,y):")) {
+                        goto client_disconnected;
+                    }
                 }
                 else if (command == "CH") {
                     vector<Point> points;
@@ -205,13 +306,17 @@ void handleClient(int clientSocket) {
                     }
                     
                     if (points.size() < 3) {
-                        sendMessageToClient(clientSocket, "0.0");
+                        if (!sendMessageToClient(clientSocket, "0.0")) {
+                            goto client_disconnected;
+                        }
                     } else {
                         auto hull = computeConvexHull(points);
                         double area = calculatePolygonArea(hull);
                         ostringstream out;
                         out << fixed << setprecision(1) << area;
-                        sendMessageToClient(clientSocket, out.str());
+                        if (!sendMessageToClient(clientSocket, out.str())) {
+                            goto client_disconnected;
+                        }
                     }
                 }
                 else if (command.substr(0, 9) == "Newpoint ") {
@@ -220,7 +325,9 @@ void handleClient(int clientSocket) {
                         lock_guard<mutex> lock(graphMutex);
                         sharedGraphPoints.push_back(p);
                     }
-                    sendMessageToClient(clientSocket, "Point added");
+                    if (!sendMessageToClient(clientSocket, "Point added")) {
+                        goto client_disconnected;
+                    }
                 }
                 else if (command.substr(0, 12) == "Removepoint ") {
                     Point p = parsePointFromString(command.substr(12));
@@ -235,32 +342,74 @@ void handleClient(int clientSocket) {
                             }
                         }
                     }
-                    sendMessageToClient(clientSocket, found ? "Point removed" : "Point not found");
+                    if (!sendMessageToClient(clientSocket, found ? "Point removed" : "Point not found")) {
+                        goto client_disconnected;
+                    }
+                }
+                else if (command == "exit" || command == "quit") {
+                    sendMessageToClient(clientSocket, "Goodbye!");
+                    break;
                 }
                 else {
-                    sendMessageToClient(clientSocket, "Error: Unknown command");
+                    if (!sendMessageToClient(clientSocket, "Error: Unknown command")) {
+                        goto client_disconnected;
+                    }
                 }
             }
             catch (const exception& e) {
-                sendMessageToClient(clientSocket, "Error: " + string(e.what()));
+                string errorMsg = "Error: " + string(e.what());
+                if (!sendMessageToClient(clientSocket, errorMsg)) {
+                    goto client_disconnected;
+                }
             }
         }
     }
 
-    close(clientSocket);
+client_disconnected:
+    cout << "[Client " << clientSocket << "] Handler ending" << endl;
+    cleanupClient(clientSocket);
+}
+
+// Signal handler for graceful shutdown
+void signalHandler(int signum) {
+    cout << "\n[Server] Received signal " << signum << ", shutting down gracefully..." << endl;
+    serverRunning = false;
+    
+    // Close all client sockets to wake up threads
+    {
+        lock_guard<mutex> lock(threadMapMutex);
+        for (auto& [socket, clientThread] : clientThreads) {
+            if (clientThread->isActive) {
+                cout << "[Server] Closing client socket " << socket << endl;
+                shutdown(socket, SHUT_RDWR);
+            }
+        }
+    }
+    
+    // Wake up cleanup thread
+    cleanupCondition.notify_all();
 }
 
 int main() {
+    // Set up signal handlers for graceful shutdown
+    signal(SIGINT, signalHandler);   // CTRL+C
+    signal(SIGTERM, signalHandler);  // Termination signal
+    
+    cout << "=== Multi-threaded Convex Hull Server ===" << endl;
+    
     // Server setup
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket < 0) {
-        cerr << "Error creating socket" << endl;
+        cerr << "Error creating socket: " << strerror(errno) << endl;
         return 1;
     }
 
     // Set socket options
     int opt = 1;
-    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        cerr << "Error setting socket options: " << strerror(errno) << endl;
+        return 1;
+    }
 
     // Configure server address
     sockaddr_in serverAddr;
@@ -270,33 +419,79 @@ int main() {
     memset(&(serverAddr.sin_zero), '\0', 8);
 
     if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        cerr << "Error binding socket" << endl;
+        cerr << "Error binding socket: " << strerror(errno) << endl;
         return 1;
     }
 
     if (listen(serverSocket, 10) < 0) {
-        cerr << "Error listening on socket" << endl;
+        cerr << "Error listening on socket: " << strerror(errno) << endl;
         return 1;
     }
 
     cout << "Server started on port " << PORT << " (Multi-threaded version)" << endl;
+    cout << "Waiting for connections... (Press Ctrl+C to stop)" << endl;
+
+    // Start cleanup thread
+    cleanupThread = thread(cleanupFinishedThreads);
+
+    // Set server socket to non-blocking for graceful shutdown
+    int flags = fcntl(serverSocket, F_GETFL, 0);
+    fcntl(serverSocket, F_SETFL, flags | O_NONBLOCK);
 
     // Main accept loop
-    while (true) {
+    while (serverRunning) {
         sockaddr_in clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
         int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientLen);
         
         if (clientSocket < 0) {
-            cerr << "Error accepting connection" << endl;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No pending connections, sleep briefly and continue
+                this_thread::sleep_for(chrono::milliseconds(100));
+                continue;
+            } else if (serverRunning) {  // Only print error if we're not shutting down
+                cerr << "Error accepting connection: " << strerror(errno) << endl;
+            }
             continue;
         }
 
-        // Create and detach new client thread
-        clientThreads[clientSocket] = thread(handleClient, clientSocket);
-        clientThreads[clientSocket].detach();
+        cout << "[Server] New client connected: " << clientSocket << endl;
+
+        // Create new client thread with proper management
+        {
+            lock_guard<mutex> lock(threadMapMutex);
+            auto clientThreadObj = make_unique<ClientThread>(clientSocket);
+            clientThreadObj->clientThread = thread(handleClient, clientSocket);
+            clientThreads[clientSocket] = move(clientThreadObj);
+        }
     }
 
+    // Graceful shutdown
+    cout << "[Server] Shutting down..." << endl;
+    
+    // Stop accepting new connections
     close(serverSocket);
+    
+    // Wait for all client threads to finish
+    cout << "[Server] Waiting for client threads to finish..." << endl;
+    {
+        lock_guard<mutex> lock(threadMapMutex);
+        for (auto& [socket, clientThread] : clientThreads) {
+            clientThread->isActive = false;
+            if (clientThread->clientThread.joinable()) {
+                cout << "[Server] Joining thread for client " << socket << endl;
+                clientThread->clientThread.join();
+            }
+        }
+        clientThreads.clear();
+    }
+    
+    // Stop cleanup thread
+    cleanupCondition.notify_all();
+    if (cleanupThread.joinable()) {
+        cleanupThread.join();
+    }
+    
+    cout << "[Server] All threads terminated. Goodbye!" << endl;
     return 0;
 }

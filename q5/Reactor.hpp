@@ -48,7 +48,7 @@ public:
      * 
      * @param fd    File descriptor to monitor.
      * @param func  Callback function to call when fd is ready for reading.
-     * @return int  0 on success.
+     * @return int  0 on success, -1 on error.
      */
     int addFd(int fd, reactorFunc func);
 
@@ -56,7 +56,7 @@ public:
      * @brief Removes a file descriptor from the reactor.
      * 
      * @param fd    File descriptor to remove.
-     * @return int  0 on success.
+     * @return int  0 on success, -1 on error.
      */
     int removeFd(int fd);
 
@@ -66,4 +66,11 @@ public:
      * @return int  0 on success.
      */
     int stop();
+
+    /**
+     * @brief Check if reactor is currently running.
+     * 
+     * @return bool true if running, false otherwise.
+     */
+    bool isRunning() const;
 };
